@@ -1,0 +1,875 @@
+# pip install pyserial pyqtgraph PyQt5
+
+import sys
+import csv
+import time
+import re
+from collections import deque
+from datetime import datetime
+
+import serial
+from PyQt5 import QtWidgets, QtCore
+import pyqtgraph as pg
+
+# ============================================================
+# SERIAL SETTINGS
+# ============================================================
+PLOTTER_PORT = "COM11"
+PLOTTER_BAUD = 115200
+
+SENSOR_PORT  = "COM3"
+SENSOR_BAUD  = 38400
+
+SERIAL_TIMEOUT = 0
+
+# ============================================================
+# CALIBRATION SETTINGS
+# ============================================================
+X_MIN_MM  = 50
+X_MAX_MM  = 66
+X_STEP_MM = 1
+
+Y_MIN_MM  = 20
+Y_MAX_MM  = 40
+Y_STEP_MM = 1
+
+REPEATS_PER_POINT = 2
+
+# --- FIXED: was 0.05 s (50 ms) — too short, stage still moving.
+#     250 ms gives mechanical platters time to decelerate and settle.
+#     Increase further if you still see motion artifacts in the data.
+SETTLE_SECONDS = 0.25
+
+# --- FIXED: was 1 — single sample gives no within-point noise estimate
+#     and no chance to discard the transient.  5 samples at 50 ms polling
+#     interval adds ~250 ms and gives sensor_char a settled reading to use.
+SAMPLES_PER_POINT = 5
+
+# --- NEW: re-zero the baseline at the start of every repeat so that
+#     delta_* features do not accumulate the inter-repeat drift that was
+#     visible as a ~20–80 count shift between repeat-1 and repeat-2.
+REBASELINE_EACH_REPEAT = True
+
+# --- NEW: optional position confirmation before capture.
+#     When True the state machine pauses after SETTLE and sends "P" to the
+#     plotter until the reported position is within tolerance, then starts
+#     capture.  Requires the plotter firmware to respond to "P" with
+#     "X: <n>, Y: <n>" or similar (matched by POS_PATTERNS below).
+#     Set False if your firmware does not support that query.
+USE_POSITION_CONFIRM     = False
+POS_CONFIRM_TOLERANCE_MM = 0.5     # mm — acceptable distance from target
+POS_CONFIRM_TIMEOUT_SEC  = 2.0     # fall through to CAPTURE after this
+POS_P_INTERVAL_SEC       = 0.15    # how often to send "P" during CONFIRM
+
+CAPTURE_TIMEOUT_SEC      = 8.0
+C_REQUEST_INTERVAL_SEC   = 0.05
+
+HOME_X_MM = 58
+HOME_Y_MM = 30
+
+# --- NEW: timestamped output so reruns never overwrite good data.
+#     Files are written as  sensor_position_calibration_YYYYMMDD_HHMMSS.csv
+OUTPUT_CSV_BASE = "sensor_position_calibration"
+TIMESTAMP_CSV   = True
+
+# ============================================================
+# PLOT SETTINGS
+# ============================================================
+MAX_POINTS         = 500
+MAX_LINES_PER_UPDATE = 80
+DEFAULT_Y_MIN      = -450
+DEFAULT_Y_MAX      = 150
+Y_MARGIN           = 20
+SMOOTH_N           = 5
+
+# ============================================================
+# PARSERS
+# ============================================================
+ADC_PATTERN = re.compile(
+    r"PA0:\s*(-?\d+)\s*,\s*PA5:\s*(-?\d+)\s*,\s*PA6:\s*(-?\d+)",
+    re.IGNORECASE,
+)
+
+POS_PATTERNS = [
+    re.compile(
+        r"X\s*[:=]\s*(-?\d+(?:\.\d+)?)\s*[, ]+\s*Y\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"P\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
+]
+
+# ============================================================
+# OPEN SERIAL PORTS
+# ============================================================
+try:
+    plotter_ser = serial.Serial(PLOTTER_PORT, PLOTTER_BAUD, timeout=SERIAL_TIMEOUT)
+    time.sleep(2)
+    plotter_ser.reset_input_buffer()
+except serial.SerialException as e:
+    print(f"Could not open plotter serial port {PLOTTER_PORT}: {e}")
+    sys.exit(1)
+
+try:
+    sensor_ser = serial.Serial(SENSOR_PORT, SENSOR_BAUD, timeout=SERIAL_TIMEOUT)
+    time.sleep(2)
+    sensor_ser.reset_input_buffer()
+except serial.SerialException as e:
+    print(f"Could not open sensor serial port {SENSOR_PORT}: {e}")
+    sys.exit(1)
+
+# ============================================================
+# RUNTIME STATE
+# ============================================================
+baseline_pa0 = None
+baseline_pa5 = None
+baseline_pa6 = None
+
+plotter_buffer = ""
+sensor_buffer  = ""
+
+last_c_request_time = 0.0
+last_p_request_time = 0.0    # NEW: tracks P queries during CONFIRM state
+sample_counter = 0
+
+y_pa0 = deque(maxlen=MAX_POINTS)
+y_pa5 = deque(maxlen=MAX_POINTS)
+y_pa6 = deque(maxlen=MAX_POINTS)
+
+# NEW: per-point sample accumulators.
+# FIXED: previously smooth was computed over the whole-session deques, so a
+#        reading at point N blended values from point N-1.  These lists are
+#        reset for every new point so smooth only reflects samples at the
+#        current commanded position.
+point_pa0_samples = []
+point_pa5_samples = []
+point_pa6_samples = []
+
+rows = []
+
+session_sequence = []
+session_index    = -1
+# Valid states: IDLE, SETTLE, CONFIRM, CAPTURE, DONE
+session_state    = "IDLE"
+session_start_time = None
+state_start_time   = None
+
+current_repeat  = None
+current_x_mm    = None
+current_y_mm    = None
+samples_this_point = 0
+
+last_seen_x_mm = None
+last_seen_y_mm = None
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def moving_avg(values, n):
+    vals = list(values)
+    if not vals:
+        return 0.0
+    if len(vals) < n:
+        return sum(vals) / len(vals)
+    return sum(vals[-n:]) / n
+
+
+def parse_adc_line(line):
+    match = ADC_PATTERN.search(line)
+    if not match:
+        return None
+    return tuple(int(x) for x in match.groups())
+
+
+def parse_position_line(line):
+    for pattern in POS_PATTERNS:
+        match = pattern.search(line)
+        if match:
+            return float(match.group(1)), float(match.group(2))
+    return None
+
+
+def send_plotter_cmd(cmd):
+    try:
+        msg = cmd + "\r\n"
+        print("PLOTTER TX:", repr(msg))
+        plotter_ser.write(msg.encode("utf-8"))
+        plotter_ser.flush()
+        return True
+    except Exception as e:
+        status_label.setText(f"Status: plotter write failed: {e}")
+        print("PLOTTER TX ERROR:", e)
+        return False
+
+
+def send_sensor_cmd(cmd):
+    try:
+        msg = cmd + "\r\n"
+        print("SENSOR TX:", repr(msg))
+        sensor_ser.write(msg.encode("utf-8"))
+        sensor_ser.flush()
+        return True
+    except Exception as e:
+        status_label.setText(f"Status: sensor write failed: {e}")
+        print("SENSOR TX ERROR:", e)
+        return False
+
+
+def maybe_expand_ylim(v0, v5, v6):
+    ymin, ymax = plot.getViewBox().viewRange()[1]
+    low  = min(v0, v5, v6)
+    high = max(v0, v5, v6)
+
+    new_ymin = ymin
+    new_ymax = ymax
+
+    if low < ymin:
+        new_ymin = min(DEFAULT_Y_MIN, low - Y_MARGIN)
+    if high > ymax:
+        new_ymax = max(DEFAULT_Y_MAX, high + Y_MARGIN)
+
+    if new_ymin != ymin or new_ymax != ymax:
+        plot.setYRange(new_ymin, new_ymax, padding=0)
+
+
+def reset_live_state(clear_baseline=True):
+    global baseline_pa0, baseline_pa5, baseline_pa6
+    global plotter_buffer, sensor_buffer, sample_counter
+    global point_pa0_samples, point_pa5_samples, point_pa6_samples
+
+    if clear_baseline:
+        baseline_pa0 = None
+        baseline_pa5 = None
+        baseline_pa6 = None
+
+    plotter_buffer = ""
+    sensor_buffer  = ""
+    sample_counter = 0
+
+    # Reset per-point accumulators
+    point_pa0_samples = []
+    point_pa5_samples = []
+    point_pa6_samples = []
+
+    y_pa0.clear()
+    y_pa5.clear()
+    y_pa6.clear()
+
+    curve_pa0.setData([], [])
+    curve_pa5.setData([], [])
+    curve_pa6.setData([], [])
+    plot.setYRange(DEFAULT_Y_MIN, DEFAULT_Y_MAX, padding=0)
+    plot.setXRange(0, MAX_POINTS - 1, padding=0)
+
+    try:
+        plotter_ser.reset_input_buffer()
+    except Exception:
+        pass
+
+    try:
+        sensor_ser.reset_input_buffer()
+    except Exception:
+        pass
+
+
+def build_session_sequence():
+    xs = list(range(X_MIN_MM, X_MAX_MM + 1, X_STEP_MM))
+    ys = list(range(Y_MIN_MM, Y_MAX_MM + 1, Y_STEP_MM))
+
+    seq = []
+    for repeat_num in range(1, REPEATS_PER_POINT + 1):
+        for row_idx, y in enumerate(ys):
+            x_order = xs if row_idx % 2 == 0 else list(reversed(xs))
+            for x in x_order:
+                seq.append((repeat_num, x, y))
+    return seq
+
+
+def _make_output_path():
+    """Return the CSV path for the current session."""
+    if TIMESTAMP_CSV:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{OUTPUT_CSV_BASE}_{ts}.csv"
+    return f"{OUTPUT_CSV_BASE}.csv"
+
+
+def save_rows_to_csv():
+    if not rows:
+        status_label.setText("Status: no data to save")
+        return
+
+    fieldnames = [
+        "session_time_s",
+        "point_time_s",
+        "point_index",
+        "repeat",
+        "cmd_x_mm",
+        "cmd_y_mm",
+        "raw_pa0",
+        "raw_pa5",
+        "raw_pa6",
+        "delta_pa0",
+        "delta_pa5",
+        "delta_pa6",
+        "smooth_pa0",
+        "smooth_pa5",
+        "smooth_pa6",
+    ]
+
+    path = _make_output_path()
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    status_label.setText(f"Status: saved {len(rows)} rows to {path}")
+    print(f"Saved {len(rows)} rows to {path}")
+
+
+def advance_to_next_point():
+    global session_index, session_state, state_start_time
+    global current_repeat, current_x_mm, current_y_mm, samples_this_point
+    global point_pa0_samples, point_pa5_samples, point_pa6_samples
+
+    session_index += 1
+
+    if session_index >= len(session_sequence):
+        session_state  = "DONE"
+        state_start_time = time.monotonic()
+        current_repeat = None
+        current_x_mm   = None
+        current_y_mm   = None
+        samples_this_point = 0
+
+        prompt_label.setText("DONE")
+        instruction_label.setText("Calibration finished")
+        countdown_label.setText("Capture: done")
+        progress_label.setText(f"Completed {len(rows)} rows")
+        point_label.setText("Target point: -")
+        samples_label.setText("Samples at point: -")
+        save_rows_to_csv()
+        return
+
+    new_repeat, new_x, new_y = session_sequence[session_index]
+
+    # FIXED: re-zero the baseline whenever we cross into a new repeat so that
+    #        delta_* values are relative to the sensor state at the start of
+    #        *this* repeat rather than the start of the entire session.
+    #        This removes the ~20-80 count inter-repeat shift seen in the data.
+    if REBASELINE_EACH_REPEAT and current_repeat is not None and new_repeat != current_repeat:
+        reset_live_state(clear_baseline=True)
+        baseline_label.setText("Baseline: re-zeroing for new repeat…")
+        status_label.setText(f"Status: rebaselining for repeat {new_repeat}")
+        print(f"Repeat boundary {current_repeat}→{new_repeat}: baseline reset")
+
+    current_repeat, current_x_mm, current_y_mm = new_repeat, new_x, new_y
+    samples_this_point = 0
+
+    # Reset per-point sample lists so smooth is scoped to this point only
+    point_pa0_samples = []
+    point_pa5_samples = []
+    point_pa6_samples = []
+
+    ok = send_plotter_cmd(f"G {current_x_mm} {current_y_mm}")
+    if not ok:
+        return
+
+    session_state    = "SETTLE"
+    state_start_time = time.monotonic()
+
+    prompt_label.setText(f"G {current_x_mm} {current_y_mm}")
+    instruction_label.setText("Moving to calibration point")
+    countdown_label.setText(f"Prepare: {SETTLE_SECONDS:0.2f}s")
+    progress_label.setText(
+        f"Point {session_index + 1}/{len(session_sequence)} | Repeat {current_repeat}/{REPEATS_PER_POINT}"
+    )
+    point_label.setText(f"Target point: X={current_x_mm} mm, Y={current_y_mm} mm")
+    samples_label.setText(f"Samples at point: 0/{SAMPLES_PER_POINT}")
+    status_label.setText("Status: moving plotter")
+
+
+def start_collection():
+    global rows, session_sequence, session_index
+    global session_start_time, session_state, state_start_time
+
+    if baseline_pa0 is None:
+        status_label.setText("Status: waiting for first valid sensor sample")
+        return
+
+    rows             = []
+    session_sequence = build_session_sequence()
+    session_index    = -1
+    session_start_time = time.monotonic()
+    session_state    = "IDLE"
+    state_start_time = None
+
+    status_label.setText("Status: calibration started")
+    advance_to_next_point()
+
+
+def stop_collection():
+    global session_state
+    session_state = "IDLE"
+    prompt_label.setText("STOPPED")
+    instruction_label.setText("Collection stopped")
+    countdown_label.setText("Prepare/Capture: --")
+    status_label.setText("Status: stopped")
+    progress_label.setText(f"Collected {len(rows)} rows")
+
+
+def rebaseline():
+    global session_state
+    session_state = "IDLE"
+    reset_live_state(clear_baseline=True)
+
+    prompt_label.setText("WAITING")
+    instruction_label.setText("Waiting for first valid sensor sample to set baseline")
+    countdown_label.setText("Prepare/Capture: --")
+    status_label.setText("Status: baseline reset")
+    progress_label.setText("No active collection")
+    baseline_label.setText("Baseline: not set")
+    samples_label.setText("Samples at point: -")
+
+
+def go_home():
+    global session_state
+    session_state = "IDLE"
+    send_plotter_cmd(f"G {HOME_X_MM} {HOME_Y_MM}")
+    prompt_label.setText(f"G {HOME_X_MM} {HOME_Y_MM}")
+    instruction_label.setText("Sent home command")
+    countdown_label.setText("Prepare/Capture: --")
+    status_label.setText("Status: moving to home")
+
+
+def query_position():
+    send_plotter_cmd("P")
+    status_label.setText("Status: sent P to plotter")
+
+
+def poll_sensor_once():
+    send_sensor_cmd("C")
+    status_label.setText("Status: sent C to sensor")
+
+
+def session_state_start_capture():
+    global session_state, state_start_time, samples_this_point
+    session_state      = "CAPTURE"
+    state_start_time   = time.monotonic()
+    samples_this_point = 0
+    countdown_label.setText(f"Capture: 0/{SAMPLES_PER_POINT}")
+    status_label.setText(f"Status: capturing at X={current_x_mm}, Y={current_y_mm}")
+
+
+def update_session_clock():
+    global session_state, state_start_time, last_p_request_time
+
+    if session_state not in ("SETTLE", "CONFIRM", "CAPTURE"):
+        return
+
+    now     = time.monotonic()
+    elapsed = now - state_start_time
+
+    if session_state == "SETTLE":
+        remaining = max(0.0, SETTLE_SECONDS - elapsed)
+        countdown_label.setText(f"Prepare: {remaining:0.2f}s")
+
+        if elapsed >= SETTLE_SECONDS:
+            if USE_POSITION_CONFIRM:
+                # Enter CONFIRM: keep querying P until position is within
+                # tolerance or we time out.
+                session_state    = "CONFIRM"
+                state_start_time = now
+                last_p_request_time = 0.0
+                countdown_label.setText("Confirming position…")
+                status_label.setText("Status: awaiting position confirmation")
+                send_plotter_cmd("P")
+                last_p_request_time = now
+            else:
+                session_state_start_capture()
+
+    elif session_state == "CONFIRM":
+        # Position-confirmed settling (only active when USE_POSITION_CONFIRM=True).
+        # Periodically send "P" and check the response parsed in read_plotter_serial.
+        if elapsed >= POS_CONFIRM_TIMEOUT_SEC:
+            # Timed out — proceed anyway so the session is not stuck.
+            status_label.setText(
+                f"Status: pos-confirm timeout at X={current_x_mm}, Y={current_y_mm} — capturing anyway"
+            )
+            session_state_start_capture()
+        else:
+            # Check whether the reported position is within tolerance.
+            if (last_seen_x_mm is not None and last_seen_y_mm is not None):
+                dx = abs(last_seen_x_mm - current_x_mm)
+                dy = abs(last_seen_y_mm - current_y_mm)
+                if dx <= POS_CONFIRM_TOLERANCE_MM and dy <= POS_CONFIRM_TOLERANCE_MM:
+                    status_label.setText(
+                        f"Status: position confirmed ({last_seen_x_mm:.2f}, {last_seen_y_mm:.2f})"
+                    )
+                    session_state_start_capture()
+                    return
+
+            # Not yet confirmed — keep polling P
+            if now - last_p_request_time >= POS_P_INTERVAL_SEC:
+                send_plotter_cmd("P")
+                last_p_request_time = now
+            countdown_label.setText(
+                f"Confirming… {POS_CONFIRM_TIMEOUT_SEC - elapsed:.1f}s"
+            )
+
+    elif session_state == "CAPTURE":
+        countdown_label.setText(
+            f"Capture: {samples_this_point}/{SAMPLES_PER_POINT} | {elapsed:0.2f}s"
+        )
+        if elapsed >= CAPTURE_TIMEOUT_SEC:
+            status_label.setText("Status: capture timeout, advancing")
+            advance_to_next_point()
+
+
+def request_sensor_periodically():
+    global last_c_request_time
+
+    # FIXED: was only polling when baseline was None or state==CAPTURE.
+    # Now also poll during SETTLE and CONFIRM so:
+    #   (a) the baseline is refreshed promptly after a repeat-boundary reset, and
+    #   (b) we have warm sensor data the moment CAPTURE begins.
+    active = (baseline_pa0 is None) or (session_state in ("CAPTURE", "SETTLE", "CONFIRM"))
+    if not active:
+        return
+
+    now = time.monotonic()
+    if now - last_c_request_time >= C_REQUEST_INTERVAL_SEC:
+        send_sensor_cmd("C")
+        last_c_request_time = now
+
+
+def append_training_row(raw_pa0, raw_pa5, raw_pa6, delta_pa0, delta_pa5, delta_pa6):
+    global samples_this_point
+
+    if session_state != "CAPTURE":
+        return
+    if current_x_mm is None or current_y_mm is None or session_start_time is None:
+        return
+
+    now = time.monotonic()
+
+    # FIXED: append to per-point lists BEFORE computing smooth so that the
+    #        current sample is included in the moving average.
+    #        Previously smooth used the whole-session deques and mixed in
+    #        readings from the previous commanded position.
+    point_pa0_samples.append(raw_pa0)
+    point_pa5_samples.append(raw_pa5)
+    point_pa6_samples.append(raw_pa6)
+
+    row = {
+        "session_time_s": now - session_start_time,
+        "point_time_s":   now - state_start_time,
+        "point_index":    session_index,
+        "repeat":         current_repeat,
+        "cmd_x_mm":       current_x_mm,
+        "cmd_y_mm":       current_y_mm,
+        "raw_pa0":        raw_pa0,
+        "raw_pa5":        raw_pa5,
+        "raw_pa6":        raw_pa6,
+        "delta_pa0":      delta_pa0,
+        "delta_pa5":      delta_pa5,
+        "delta_pa6":      delta_pa6,
+        # FIXED: smooth computed from per-point accumulators, not session deques
+        "smooth_pa0":     moving_avg(point_pa0_samples, SMOOTH_N),
+        "smooth_pa5":     moving_avg(point_pa5_samples, SMOOTH_N),
+        "smooth_pa6":     moving_avg(point_pa6_samples, SMOOTH_N),
+    }
+    rows.append(row)
+
+    samples_this_point += 1
+    samples_label.setText(f"Samples at point: {samples_this_point}/{SAMPLES_PER_POINT}")
+
+    if samples_this_point >= SAMPLES_PER_POINT:
+        advance_to_next_point()
+
+
+def refresh_live_plot():
+    point_count = len(y_pa0)
+    if point_count == 0:
+        curve_pa0.setData([], [])
+        curve_pa5.setData([], [])
+        curve_pa6.setData([], [])
+        plot.setXRange(0, MAX_POINTS - 1, padding=0)
+        return
+
+    x_start = max(0, sample_counter - point_count)
+    x_vals  = list(range(x_start, sample_counter))
+
+    curve_pa0.setData(x_vals, list(y_pa0))
+    curve_pa5.setData(x_vals, list(y_pa5))
+    curve_pa6.setData(x_vals, list(y_pa6))
+
+    window_start = max(0, sample_counter - MAX_POINTS)
+    window_end   = max(MAX_POINTS - 1, sample_counter - 1)
+    xmin, xmax   = plot.getViewBox().viewRange()[0]
+    if abs(xmin - window_start) > 0.5 or abs(xmax - window_end) > 0.5:
+        plot.setXRange(window_start, window_end, padding=0)
+
+
+# ============================================================
+# UI
+# ============================================================
+app = QtWidgets.QApplication(sys.argv)
+
+win = QtWidgets.QWidget()
+win.setWindowTitle("XY Plotter Sensor Position Calibration")
+layout = QtWidgets.QVBoxLayout()
+win.setLayout(layout)
+
+plot = pg.PlotWidget()
+plot.setTitle("Live Sensor Signals")
+plot.setLabel("left", "Baseline-subtracted value")
+plot.setLabel("bottom", "Sample index")
+plot.showGrid(x=True, y=True)
+plot.setYRange(DEFAULT_Y_MIN, DEFAULT_Y_MAX, padding=0)
+plot.setXRange(0, MAX_POINTS - 1, padding=0)
+plot.setMouseEnabled(x=False, y=False)
+plot.setMenuEnabled(False)
+plot.addLegend()
+
+curve_pa0 = plot.plot(pen="r", name="PA0")
+curve_pa5 = plot.plot(pen="g", name="PA5")
+curve_pa6 = plot.plot(pen="b", name="PA6")
+
+prompt_label = QtWidgets.QLabel("WAITING")
+prompt_label.setAlignment(QtCore.Qt.AlignCenter)
+prompt_label.setStyleSheet("font-size: 28pt; font-weight: bold;")
+
+instruction_label = QtWidgets.QLabel("Waiting for first valid sensor sample to set baseline")
+instruction_label.setAlignment(QtCore.Qt.AlignCenter)
+instruction_label.setStyleSheet("font-size: 14pt;")
+
+countdown_label = QtWidgets.QLabel("Prepare/Capture: --")
+countdown_label.setAlignment(QtCore.Qt.AlignCenter)
+countdown_label.setStyleSheet("font-size: 18pt;")
+
+status_label          = QtWidgets.QLabel("Status: idle")
+progress_label        = QtWidgets.QLabel("No active collection")
+baseline_label        = QtWidgets.QLabel("Baseline: not set")
+point_label           = QtWidgets.QLabel("Target point: -")
+actual_pos_label      = QtWidgets.QLabel("Reported position: -")
+samples_label         = QtWidgets.QLabel("Samples at point: -")
+last_plotter_line_label = QtWidgets.QLabel("Last plotter line: -")
+last_sensor_line_label  = QtWidgets.QLabel("Last sensor line: -")
+last_plotter_line_label.setStyleSheet("font-size: 10pt;")
+last_sensor_line_label.setStyleSheet("font-size: 10pt;")
+
+# Config summary shown at startup so the operator can verify settings
+config_label = QtWidgets.QLabel(
+    f"Config:  SETTLE={SETTLE_SECONDS*1000:.0f} ms  "
+    f"SAMPLES/PT={SAMPLES_PER_POINT}  "
+    f"REBASELINE_EACH_REPEAT={REBASELINE_EACH_REPEAT}  "
+    f"POS_CONFIRM={USE_POSITION_CONFIRM}  "
+    f"TIMESTAMP_CSV={TIMESTAMP_CSV}"
+)
+config_label.setStyleSheet("font-size: 9pt; color: #555;")
+
+button_row_1 = QtWidgets.QHBoxLayout()
+button_row_2 = QtWidgets.QHBoxLayout()
+
+btn_start      = QtWidgets.QPushButton("Start Calibration")
+btn_stop       = QtWidgets.QPushButton("Stop")
+btn_rebaseline = QtWidgets.QPushButton("Rebaseline")
+btn_save       = QtWidgets.QPushButton("Save CSV Now")
+btn_home       = QtWidgets.QPushButton("Go Home")
+btn_query_pos  = QtWidgets.QPushButton("Query Position")
+btn_poll_sensor = QtWidgets.QPushButton("Poll Sensor Once")
+
+button_row_1.addWidget(btn_start)
+button_row_1.addWidget(btn_stop)
+button_row_1.addWidget(btn_rebaseline)
+button_row_1.addWidget(btn_save)
+
+button_row_2.addWidget(btn_home)
+button_row_2.addWidget(btn_query_pos)
+button_row_2.addWidget(btn_poll_sensor)
+
+layout.addWidget(plot)
+layout.addWidget(prompt_label)
+layout.addWidget(instruction_label)
+layout.addWidget(countdown_label)
+layout.addWidget(status_label)
+layout.addWidget(progress_label)
+layout.addWidget(point_label)
+layout.addWidget(actual_pos_label)
+layout.addWidget(samples_label)
+layout.addWidget(baseline_label)
+layout.addWidget(last_plotter_line_label)
+layout.addWidget(last_sensor_line_label)
+layout.addWidget(config_label)
+layout.addLayout(button_row_1)
+layout.addLayout(button_row_2)
+
+btn_start.clicked.connect(start_collection)
+btn_stop.clicked.connect(stop_collection)
+btn_rebaseline.clicked.connect(rebaseline)
+btn_save.clicked.connect(save_rows_to_csv)
+btn_home.clicked.connect(go_home)
+btn_query_pos.clicked.connect(query_position)
+btn_poll_sensor.clicked.connect(poll_sensor_once)
+
+# ============================================================
+# SERIAL READ LOOPS
+# ============================================================
+def read_plotter_serial():
+    global plotter_buffer, last_seen_x_mm, last_seen_y_mm
+
+    try:
+        n = plotter_ser.in_waiting
+    except Exception:
+        return
+
+    if n <= 0:
+        return
+
+    try:
+        chunk = plotter_ser.read(n).decode(errors="ignore")
+    except Exception:
+        return
+
+    if not chunk:
+        return
+
+    plotter_buffer += chunk.replace("\r", "")
+    lines           = plotter_buffer.split("\n")
+    plotter_buffer  = lines[-1]
+    complete_lines  = lines[:-1]
+
+    if len(complete_lines) > MAX_LINES_PER_UPDATE:
+        complete_lines = complete_lines[-MAX_LINES_PER_UPDATE:]
+
+    for line in complete_lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        last_plotter_line_label.setText(f"Last plotter line: {line[:140]}")
+
+        pos = parse_position_line(line)
+        if pos is not None:
+            last_seen_x_mm, last_seen_y_mm = pos
+            actual_pos_label.setText(
+                f"Reported position: X={last_seen_x_mm:.3f} mm, Y={last_seen_y_mm:.3f} mm"
+            )
+
+
+def read_sensor_serial():
+    global sensor_buffer, baseline_pa0, baseline_pa5, baseline_pa6, sample_counter
+
+    try:
+        n = sensor_ser.in_waiting
+    except Exception:
+        return False
+
+    if n <= 0:
+        return False
+
+    try:
+        chunk = sensor_ser.read(n).decode(errors="ignore")
+    except Exception:
+        return False
+
+    if not chunk:
+        return False
+
+    sensor_buffer += chunk.replace("\r", "")
+    lines          = sensor_buffer.split("\n")
+    sensor_buffer  = lines[-1]
+    complete_lines = lines[:-1]
+
+    if len(complete_lines) > MAX_LINES_PER_UPDATE:
+        complete_lines = complete_lines[-MAX_LINES_PER_UPDATE:]
+
+    updated_plot = False
+
+    for line in complete_lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        last_sensor_line_label.setText(f"Last sensor line: {line[:140]}")
+
+        parsed = parse_adc_line(line)
+        if parsed is None:
+            continue
+
+        raw_pa0, raw_pa5, raw_pa6 = parsed
+
+        if baseline_pa0 is None:
+            baseline_pa0 = raw_pa0
+            baseline_pa5 = raw_pa5
+            baseline_pa6 = raw_pa6
+            baseline_label.setText(
+                f"Baseline: PA0={baseline_pa0}, PA5={baseline_pa5}, PA6={baseline_pa6}"
+            )
+            instruction_label.setText("Baseline ready. Press Start Calibration.")
+            status_label.setText("Status: baseline ready")
+            print(f"Baseline set: PA0={baseline_pa0}, PA5={baseline_pa5}, PA6={baseline_pa6}")
+            continue
+
+        delta_pa0 = raw_pa0 - baseline_pa0
+        delta_pa5 = raw_pa5 - baseline_pa5
+        delta_pa6 = raw_pa6 - baseline_pa6
+
+        y_pa0.append(delta_pa0)
+        y_pa5.append(delta_pa5)
+        y_pa6.append(delta_pa6)
+
+        maybe_expand_ylim(delta_pa0, delta_pa5, delta_pa6)
+        append_training_row(raw_pa0, raw_pa5, raw_pa6, delta_pa0, delta_pa5, delta_pa6)
+
+        sample_counter += 1
+        updated_plot = True
+
+    return updated_plot
+
+
+# ============================================================
+# MAIN UPDATE LOOP
+# ============================================================
+def update():
+    update_session_clock()
+    request_sensor_periodically()
+    read_plotter_serial()
+    updated_plot = read_sensor_serial()
+
+    if updated_plot:
+        refresh_live_plot()
+
+
+# ============================================================
+# START APP
+# ============================================================
+timer = QtCore.QTimer()
+timer.timeout.connect(update)
+timer.start(10)
+
+win.resize(1250, 950)
+win.show()
+
+print(f"Plotter connected on {PLOTTER_PORT} @ {PLOTTER_BAUD}")
+print(f"Sensor  connected on {SENSOR_PORT}  @ {SENSOR_BAUD}")
+print(f"Config: SETTLE={SETTLE_SECONDS*1000:.0f}ms  SAMPLES/PT={SAMPLES_PER_POINT}  "
+      f"REBASELINE_EACH_REPEAT={REBASELINE_EACH_REPEAT}  "
+      f"USE_POSITION_CONFIRM={USE_POSITION_CONFIRM}")
+print("Arduino gets G/P commands.  STM gets C commands and returns ADC lines.")
+
+try:
+    sys.exit(app.exec_())
+finally:
+    try:
+        plotter_ser.close()
+    except Exception:
+        pass
+
+    try:
+        sensor_ser.close()
+    except Exception:
+        pass
