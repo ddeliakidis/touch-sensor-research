@@ -36,8 +36,8 @@ import pyqtgraph as pg
 # ============================================================
 # Hardware / serial settings
 # ============================================================
-PORT = "COM3"
-BAUD = 38400
+PORT = "COM11"
+BAUD = 115200
 MAX_POINTS = 500            # samples shown in waveform plot
 MAX_LINES_PER_UPDATE = 30   # cap on serial lines processed per timer tick
 

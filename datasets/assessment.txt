@@ -1,0 +1,85 @@
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║          DATASET QUALITY ASSESSMENT FOR REGRESSION MODELING  (v2)         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+━━━ DATASET OVERVIEW ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Total rows          : 3570
+  Unique XY positions : 357  (17 x-values × 21 y-values = 357 grid points)
+  Repeats             : 2  →  1785 samples per repeat
+  Statistical outliers: 1 (0.0%)
+  Clean rows          : 90%  (edge_fail=False AND is_outlier=False)
+
+━━━ REPEATABILITY (RMS counts, repeat-1 minus repeat-2) ━━━━━━━━━━━━━━━━━━━━
+  Channel   All      Interior (y≤35)   Edge (y>35)
+  pa0       18.2    20.5              7.2
+  pa5       21.4    24.1              7.9
+  pa6       16.1    14.0              21.7
+
+  Interior repeatability is significantly better than the pooled figure.
+  Edge failures inflate the pa5/pa6 numbers substantially.
+
+━━━ DRIFT (linear trend counts/s) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ repeat channel  drift_counts_per_s
+      1     pa0              2.0340
+      1     pa5              2.6688
+      1     pa6             -2.0000
+      2     pa0              1.6820
+      2     pa5              2.3490
+      2     pa6             -1.9762
+
+  PA6 drifts ~18–21 counts/s.  Demeaned features correct this automatically.
+
+━━━ NOISE (estimated std from |r1−r2|/√2) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+channel  median  p95   max
+    pa0     2.1  7.8 108.2
+    pa5     2.1 12.7 116.0
+    pa6     2.1 12.0  99.7
+  (interior only — edge noise is dominated by failure artifacts)
+
+━━━ FEATURE–TARGET CORRELATIONS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Channel     corr(raw, cmd_x_mm)   corr(raw, cmd_y_mm)
+  raw_pa0     +0.438                  +0.532
+  raw_pa5     -0.256                  +0.666
+  raw_pa6     +0.158                  -0.694
+
+━━━ MODEL RESULTS (GradientBoosting + combined features) ━━━━━━━━━━━━━━━━━━━━
+  Train: repeat-1  (1599 clean rows)
+  Test : repeat-2  (1628 clean rows)
+
+  Region        X-MAE (mm)   Y-MAE (mm)   XY-MAE (mm)
+  All           0.759        0.456        0.972
+  Interior      0.766        0.390        0.936
+  Edge          0.737        0.654        1.079
+
+Full comparison across all models and feature sets:
+  → datasets/model_evaluation.csv
+
+━━━ HARDWARE / DATA ISSUES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. WITHIN-POINT OUTLIERS:  343 rows flagged as edge_fail
+     (|raw − group_median| > 4·σ on at least one channel,
+     σ estimated robustly from MAD of per-group residuals).
+     Excluded from modeling when CLEAN_ONLY=True.
+
+  2. INTER-REPEAT DELTA DRIFT:  delta_* features shift ~20–80 counts
+     between repeats.  FIXED in v2 by rc_delta_* (per-repeat recentering).
+
+  3. PA6 SESSION DRIFT (~19 counts/s):
+     FIXED in v2 by dm_* features (rolling-window demeaning).
+
+  4. MOTION ARTIFACTS AT Y-BOUNDARIES:  single-sample delta spikes.
+     FIXED by edge_fail flag + CLEAN_ONLY filter.
+
+  5. SMOOTH FEATURES LEAK TEMPORAL CONTEXT:
+     Safe only when splitting by repeat (which we do).  Do NOT use
+     smooth_* features if ever splitting by random row index.
+
+━━━ RECOMMENDED MODELING SETUP ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  • Feature set : "combined"  (raw + pairwise ratios + polynomial interactions)
+  • Model       : GradientBoosting  (best MAE in interior region)
+  • Split       : repeat-1 → train,  repeat-2 → test
+  • Filter      : CLEAN_ONLY = True  (exclude is_outlier | edge_fail rows)
+  • Separate    : independent X-regressor and Y-regressor
+  • Restrict    : evaluate interior (y ≤ 35) and edge separately
+  • Uncertainty : use GPR posterior std as a confidence indicator per prediction

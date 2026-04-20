@@ -81,15 +81,14 @@ except ImportError:
 # ──────────────────────────────────────────────────────────────────────────────
 # A  Configuration
 # ──────────────────────────────────────────────────────────────────────────────
-DATA_PATH       = "sensor_position_calibration.csv"
+DATA_PATH       = "sensor_position_calibration_20260419_191648.csv"
 OUT_DIR         = Path("datasets")
 PLOT_DIR        = Path("plots")
 
 TIMESERIES_K    = 5        # sliding-window look-back length
 OUTLIER_ZSCORE  = 4.0      # z-score threshold for statistical outlier flag
-EDGE_PA6_MIN    = 1500     # raw_pa6 below this → sensor off field
-EDGE_PA5_MIN    = 400      # raw_pa5 below this → transient dropout
-DELTA_FAIL_ABS  = 600      # |delta| above this → motion artifact
+EDGE_RESID_NSIG = 4.0      # row flagged if |raw - group_median| > N·MAD-σ (per channel)
+DELTA_FAIL_ABS  = 600      # |delta| above this → motion artifact (only if deltas exist)
 DEMEANED_WINDOW = 20       # rolling-median window for demeaned features
 
 CLEAN_ONLY      = True     # exclude is_outlier | edge_fail rows from modeling
@@ -265,16 +264,32 @@ def add_polynomial_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_edge_failure_flag(df: pd.DataFrame) -> pd.DataFrame:
     """
-    edge_fail = True when the sensor is outside its calibrated range.
-    Criteria (OR):  raw_pa6 < EDGE_PA6_MIN
-                  | raw_pa5 < EDGE_PA5_MIN
-                  | |any delta| > DELTA_FAIL_ABS
+    edge_fail = True when a row is a within-point outlier.
+
+    For each (cmd_x_mm, cmd_y_mm) group, subtract the group median from each
+    raw channel and measure |residual|.  The robust scale of all residuals
+    (MAD × 1.4826 ≈ σ) gives a data-derived noise floor; any row whose
+    residual exceeds EDGE_RESID_NSIG · scale on any channel is flagged.
+    Replaces the old fixed thresholds, which were calibrated for a
+    different sensor setup and don't match this dataset's scale.
+
+    Also flags |delta| > DELTA_FAIL_ABS when delta columns are present.
     """
     df = df.copy()
-    bad_pa6   = df["raw_pa6"] < EDGE_PA6_MIN
-    bad_pa5   = df["raw_pa5"] < EDGE_PA5_MIN
-    bad_delta = df[["delta_pa0","delta_pa5","delta_pa6"]].abs().max(axis=1) > DELTA_FAIL_ABS
-    df["edge_fail"] = bad_pa6 | bad_pa5 | bad_delta
+    fail = pd.Series(False, index=df.index)
+    for c in [f"raw_{ch}" for ch in CHANNELS]:
+        group_med = df.groupby(["cmd_x_mm", "cmd_y_mm"])[c].transform("median")
+        resid     = df[c] - group_med
+        scale     = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+        if scale > 1e-9:
+            fail |= resid.abs() > EDGE_RESID_NSIG * scale
+
+    delta_cols = [f"delta_{ch}" for ch in CHANNELS
+                  if f"delta_{ch}" in df.columns]
+    if delta_cols:
+        fail |= df[delta_cols].abs().max(axis=1) > DELTA_FAIL_ABS
+
+    df["edge_fail"] = fail
     return df
 
 
@@ -665,8 +680,10 @@ def plot_pa6_anomaly(df: pd.DataFrame) -> None:
     for rv, grp in df.groupby("repeat"):
         axes[1].plot(grp["cmd_y_mm"], grp["raw_pa6"],".",ms=3,alpha=0.4,
                      color=colors[rv],label=f"repeat {rv}")
-    axes[1].axhline(EDGE_PA6_MIN, color="r", lw=1.2, ls="--",
-                    label=f"failure threshold ({EDGE_PA6_MIN})")
+    if "edge_fail" in df.columns and df["edge_fail"].any():
+        ef = df[df["edge_fail"]]
+        axes[1].plot(ef["cmd_y_mm"], ef["raw_pa6"], "x", ms=7,
+                     color="red", mew=1.5, label=f"edge_fail (n={len(ef)})")
     axes[1].set_xlabel("cmd_y_mm"); axes[1].set_ylabel("raw_pa6")
     axes[1].set_title("raw_pa6 vs cmd_y_mm"); axes[1].legend(fontsize=8); axes[1].grid(True, alpha=0.3)
     fig.suptitle("PA6 sensor failure analysis")
@@ -1089,10 +1106,9 @@ def write_assessment(
     n_total  = len(df)
     n_unique = df[["cmd_x_mm","cmd_y_mm"]].drop_duplicates().shape[0]
     n_out    = int(df["is_outlier"].sum())
-    bad_pa6  = int((df["raw_pa6"] < EDGE_PA6_MIN).sum())
-    bad_pa5  = int((df["raw_pa5"] < EDGE_PA5_MIN).sum())
     if "edge_fail" not in df.columns:
         df = add_edge_failure_flag(df)
+    n_edge   = int(df["edge_fail"].sum())
     pct_good = f"{100 * (~df['edge_fail']).mean():.0f}"
 
     def rms(ch, region="all"):
@@ -1159,9 +1175,10 @@ Full comparison across all models and feature sets:
 
 ━━━ HARDWARE / DATA ISSUES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  1. PA6 FIELD EDGE (y ≥ 36 mm):  {bad_pa6} rows with raw_pa6 < {EDGE_PA6_MIN}.
-     Sensor loses the reflected beam.  Must exclude these positions OR
-     physically reposition the detector to extend the clean operating range.
+  1. WITHIN-POINT OUTLIERS:  {n_edge} rows flagged as edge_fail
+     (|raw − group_median| > {EDGE_RESID_NSIG:g}·σ on at least one channel,
+     σ estimated robustly from MAD of per-group residuals).
+     Excluded from modeling when CLEAN_ONLY=True.
 
   2. INTER-REPEAT DELTA DRIFT:  delta_* features shift ~20–80 counts
      between repeats.  FIXED in v2 by rc_delta_* (per-repeat recentering).

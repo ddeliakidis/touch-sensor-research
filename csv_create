@@ -14,11 +14,11 @@ import pyqtgraph as pg
 # ============================================================
 # SERIAL SETTINGS
 # ============================================================
-PLOTTER_PORT = "COM11"
+PLOTTER_PORT = "COM25"
 PLOTTER_BAUD = 115200
 
-SENSOR_PORT  = "COM3"
-SENSOR_BAUD  = 38400
+SENSOR_PORT  = "COM11"
+SENSOR_BAUD  = 115200
 
 SERIAL_TIMEOUT = 0
 
@@ -38,7 +38,7 @@ REPEATS_PER_POINT = 2
 # --- FIXED: was 0.05 s (50 ms) — too short, stage still moving.
 #     250 ms gives mechanical platters time to decelerate and settle.
 #     Increase further if you still see motion artifacts in the data.
-SETTLE_SECONDS = 0.25
+SETTLE_SECONDS = 0.1
 
 # --- FIXED: was 1 — single sample gives no within-point noise estimate
 #     and no chance to discard the transient.  5 samples at 50 ms polling
