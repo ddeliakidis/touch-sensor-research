@@ -1,0 +1,1008 @@
+# pip install pyserial pyqtgraph PyQt5
+
+import sys
+import csv
+import time
+import re
+from collections import deque
+from datetime import datetime
+
+import serial
+from PyQt5 import QtWidgets, QtCore
+import pyqtgraph as pg
+
+# ============================================================
+# SERIAL SETTINGS
+# ============================================================
+CNC_PORT = "COM26"          # Genmitsu / Grbl controller
+CNC_BAUD = 115200
+
+SENSOR_PORT = "COM11"       # your sensor MCU
+SENSOR_BAUD = 9600
+
+SERIAL_TIMEOUT = 0
+
+# ============================================================
+# CALIBRATION SETTINGS
+# ============================================================
+# The CNC position when you press Start Calibration becomes the local test
+# origin (0, 0). The scan below is generated in local coordinates around
+# that origin, while motion commands sent to Grbl remain absolute.
+LOCAL_X_MIN_MM = -8.0
+LOCAL_X_MAX_MM =  8.0
+LOCAL_X_STEP_MM = 0.5
+
+LOCAL_Y_MIN_MM = -10.0
+LOCAL_Y_MAX_MM =  10.0
+LOCAL_Y_STEP_MM = 0.5
+
+REPEATS_PER_POINT = 3
+
+SETTLE_SECONDS = 0.05
+SAMPLES_PER_POINT = 10
+REBASELINE_EACH_REPEAT = True
+
+USE_POSITION_CONFIRM     = True
+POS_CONFIRM_TOLERANCE_MM = 0.05
+POS_CONFIRM_TIMEOUT_SEC  = 0.05
+POS_P_INTERVAL_SEC       = 0.15
+
+CAPTURE_TIMEOUT_SEC      = 8.0
+C_REQUEST_INTERVAL_SEC   = 0.05
+
+HOME_X_MM = 0
+HOME_Y_MM = 0
+
+OUTPUT_CSV_BASE = "sensor_position_calibration"
+TIMESTAMP_CSV   = True
+
+# ============================================================
+# CNC / GRBL SETTINGS
+# ============================================================
+MOVE_FEED_MM_MIN = 2000.0
+MOVE_CMD = "G1"
+AUTO_UNLOCK = True
+AUTO_SET_MM_ABS = True
+
+USE_Z_LIFT = False
+SAFE_Z_MM = 5.0
+
+# ============================================================
+# PLOT SETTINGS
+# ============================================================
+MAX_POINTS = 500
+MAX_LINES_PER_UPDATE = 80
+DEFAULT_Y_MIN = -450
+DEFAULT_Y_MAX = 150
+Y_MARGIN = 20
+SMOOTH_N = 5
+
+# ============================================================
+# PARSERS
+# ============================================================
+ADC_PATTERN = re.compile(
+    r"PA0:\s*(-?\d+)\s*,\s*PA5:\s*(-?\d+)\s*,\s*PA6:\s*(-?\d+)",
+    re.IGNORECASE,
+)
+
+GRBL_MPOS_PATTERN = re.compile(
+    r"<[^>]*\|MPos:\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+GRBL_WPOS_PATTERN = re.compile(
+    r"<[^>]*\|WPos:\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# ============================================================
+# OPEN SERIAL PORTS
+# ============================================================
+try:
+    cnc_ser = serial.Serial(CNC_PORT, CNC_BAUD, timeout=SERIAL_TIMEOUT)
+    time.sleep(2.0)
+    cnc_ser.reset_input_buffer()
+    cnc_ser.reset_output_buffer()
+except serial.SerialException as e:
+    print(f"Could not open CNC serial port {CNC_PORT}: {e}")
+    sys.exit(1)
+
+try:
+    sensor_ser = serial.Serial(SENSOR_PORT, SENSOR_BAUD, timeout=SERIAL_TIMEOUT)
+    time.sleep(2.0)
+    sensor_ser.reset_input_buffer()
+except serial.SerialException as e:
+    print(f"Could not open sensor serial port {SENSOR_PORT}: {e}")
+    sys.exit(1)
+
+# ============================================================
+# RUNTIME STATE
+# ============================================================
+baseline_pa0 = None
+baseline_pa5 = None
+baseline_pa6 = None
+
+cnc_buffer = ""
+sensor_buffer = ""
+
+last_c_request_time = 0.0
+last_p_request_time = 0.0
+sample_counter = 0
+
+y_pa0 = deque(maxlen=MAX_POINTS)
+y_pa5 = deque(maxlen=MAX_POINTS)
+y_pa6 = deque(maxlen=MAX_POINTS)
+
+point_pa0_samples = []
+point_pa5_samples = []
+point_pa6_samples = []
+
+rows = []
+
+session_sequence = []
+session_index = -1
+session_state = "IDLE"   # IDLE, SETTLE, CONFIRM, CAPTURE, DONE
+session_start_time = None
+state_start_time = None
+
+current_repeat = None
+current_local_x_mm = None
+current_local_y_mm = None
+current_abs_x_mm = None
+current_abs_y_mm = None
+samples_this_point = 0
+
+session_origin_x_mm = None
+session_origin_y_mm = None
+session_origin_z_mm = None
+
+last_seen_x_mm = None
+last_seen_y_mm = None
+last_seen_z_mm = None
+last_status_line = ""
+
+# ============================================================
+# HELPERS
+# ============================================================
+def moving_avg(values, n):
+    vals = list(values)
+    if not vals:
+        return 0.0
+    if len(vals) < n:
+        return sum(vals) / len(vals)
+    return sum(vals[-n:]) / n
+
+
+def frange_inclusive(min_mm, max_mm, step_mm):
+    if step_mm <= 0:
+        raise ValueError("step_mm must be positive")
+    if max_mm < min_mm:
+        raise ValueError("max_mm must be >= min_mm")
+
+    vals = []
+    x = float(min_mm)
+    while x <= max_mm + 1e-9:
+        vals.append(round(x, 4))
+        x += step_mm
+    return vals
+
+
+def parse_adc_line(line):
+    match = ADC_PATTERN.search(line)
+    if not match:
+        return None
+    return tuple(int(x) for x in match.groups())
+
+
+def parse_position_line(line):
+    m = GRBL_WPOS_PATTERN.search(line)
+    if m:
+        return "WPos", float(m.group(1)), float(m.group(2)), float(m.group(3))
+
+    m = GRBL_MPOS_PATTERN.search(line)
+    if m:
+        return "MPos", float(m.group(1)), float(m.group(2)), float(m.group(3))
+
+    return None
+
+
+def send_cnc_cmd(cmd):
+    try:
+        msg = cmd + "\n"
+        print("CNC TX:", repr(msg))
+        cnc_ser.write(msg.encode("utf-8"))
+        cnc_ser.flush()
+        return True
+    except Exception as e:
+        status_label.setText(f"Status: CNC write failed: {e}")
+        print("CNC TX ERROR:", e)
+        return False
+
+
+def send_sensor_cmd(cmd):
+    try:
+        msg = cmd + "\r\n"
+        print("SENSOR TX:", repr(msg))
+        sensor_ser.write(msg.encode("utf-8"))
+        sensor_ser.flush()
+        return True
+    except Exception as e:
+        status_label.setText(f"Status: sensor write failed: {e}")
+        print("SENSOR TX ERROR:", e)
+        return False
+
+
+def wake_and_init_grbl():
+    try:
+        cnc_ser.write(b"\r\n\r\n")
+        cnc_ser.flush()
+        time.sleep(2.0)
+        cnc_ser.reset_input_buffer()
+    except Exception as e:
+        print("GRBL wake failed:", e)
+
+    if AUTO_UNLOCK:
+        send_cnc_cmd("$X")
+        time.sleep(0.2)
+
+    if AUTO_SET_MM_ABS:
+        send_cnc_cmd("G21")  # mm
+        send_cnc_cmd("G90")  # absolute coordinates
+        send_cnc_cmd("G94")  # feed per minute
+        time.sleep(0.1)
+
+    send_cnc_cmd("?")
+
+
+def maybe_expand_ylim(v0, v5, v6):
+    ymin, ymax = plot.getViewBox().viewRange()[1]
+    low = min(v0, v5, v6)
+    high = max(v0, v5, v6)
+
+    new_ymin = ymin
+    new_ymax = ymax
+
+    if low < ymin:
+        new_ymin = min(DEFAULT_Y_MIN, low - Y_MARGIN)
+    if high > ymax:
+        new_ymax = max(DEFAULT_Y_MAX, high + Y_MARGIN)
+
+    if new_ymin != ymin or new_ymax != ymax:
+        plot.setYRange(new_ymin, new_ymax, padding=0)
+
+
+def reset_live_state(clear_baseline=True):
+    global baseline_pa0, baseline_pa5, baseline_pa6
+    global cnc_buffer, sensor_buffer, sample_counter
+    global point_pa0_samples, point_pa5_samples, point_pa6_samples
+
+    if clear_baseline:
+        baseline_pa0 = None
+        baseline_pa5 = None
+        baseline_pa6 = None
+
+    cnc_buffer = ""
+    sensor_buffer = ""
+    sample_counter = 0
+
+    point_pa0_samples = []
+    point_pa5_samples = []
+    point_pa6_samples = []
+
+    y_pa0.clear()
+    y_pa5.clear()
+    y_pa6.clear()
+
+    curve_pa0.setData([], [])
+    curve_pa5.setData([], [])
+    curve_pa6.setData([], [])
+    plot.setYRange(DEFAULT_Y_MIN, DEFAULT_Y_MAX, padding=0)
+    plot.setXRange(0, MAX_POINTS - 1, padding=0)
+
+    try:
+        cnc_ser.reset_input_buffer()
+    except Exception:
+        pass
+
+    try:
+        sensor_ser.reset_input_buffer()
+    except Exception:
+        pass
+
+
+def build_session_sequence():
+    xs_local = frange_inclusive(LOCAL_X_MIN_MM, LOCAL_X_MAX_MM, LOCAL_X_STEP_MM)
+    ys_local = frange_inclusive(LOCAL_Y_MIN_MM, LOCAL_Y_MAX_MM, LOCAL_Y_STEP_MM)
+
+    seq = []
+    for repeat_num in range(1, REPEATS_PER_POINT + 1):
+        for row_idx, local_y in enumerate(ys_local):
+            x_order = xs_local if row_idx % 2 == 0 else list(reversed(xs_local))
+            for local_x in x_order:
+                seq.append((repeat_num, local_x, local_y))
+    return seq
+
+
+def _make_output_path():
+    if TIMESTAMP_CSV:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{OUTPUT_CSV_BASE}_{ts}.csv"
+    return f"{OUTPUT_CSV_BASE}.csv"
+
+
+def save_rows_to_csv():
+    if not rows:
+        status_label.setText("Status: no data to save")
+        return
+
+    fieldnames = [
+        "session_time_s",
+        "point_time_s",
+        "point_index",
+        "repeat",
+        "origin_x_mm",
+        "origin_y_mm",
+        "origin_z_mm",
+        "cmd_x_mm",
+        "cmd_y_mm",
+        "cmd_abs_x_mm",
+        "cmd_abs_y_mm",
+        "raw_pa0",
+        "raw_pa5",
+        "raw_pa6",
+        "delta_pa0",
+        "delta_pa5",
+        "delta_pa6",
+        "smooth_pa0",
+        "smooth_pa5",
+        "smooth_pa6",
+    ]
+
+    path = _make_output_path()
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    status_label.setText(f"Status: saved {len(rows)} rows to {path}")
+    print(f"Saved {len(rows)} rows to {path}")
+
+
+def move_to_xy(x_mm, y_mm):
+    if USE_Z_LIFT:
+        if not send_cnc_cmd("G90"):
+            return False
+        if not send_cnc_cmd(f"G0 Z{SAFE_Z_MM:.3f}"):
+            return False
+        time.sleep(0.05)
+
+    if not send_cnc_cmd("G90"):
+        return False
+
+    cmd = f"{MOVE_CMD} X{x_mm:.3f} Y{y_mm:.3f} F{MOVE_FEED_MM_MIN:.3f}"
+    return send_cnc_cmd(cmd)
+
+
+def advance_to_next_point():
+    global session_index, session_state, state_start_time
+    global current_repeat, current_local_x_mm, current_local_y_mm
+    global current_abs_x_mm, current_abs_y_mm, samples_this_point
+    global point_pa0_samples, point_pa5_samples, point_pa6_samples
+
+    session_index += 1
+
+    if session_index >= len(session_sequence):
+        session_state = "DONE"
+        state_start_time = time.monotonic()
+        current_repeat = None
+        current_local_x_mm = None
+        current_local_y_mm = None
+        current_abs_x_mm = None
+        current_abs_y_mm = None
+        samples_this_point = 0
+
+        prompt_label.setText("DONE")
+        instruction_label.setText("Calibration finished")
+        countdown_label.setText("Capture: done")
+        progress_label.setText(f"Completed {len(rows)} rows")
+        point_label.setText("Target point: -")
+        samples_label.setText("Samples at point: -")
+        save_rows_to_csv()
+        return
+
+    new_repeat, new_local_x, new_local_y = session_sequence[session_index]
+
+    if REBASELINE_EACH_REPEAT and current_repeat is not None and new_repeat != current_repeat:
+        reset_live_state(clear_baseline=True)
+        baseline_label.setText("Baseline: re-zeroing for new repeat…")
+        status_label.setText(f"Status: rebaselining for repeat {new_repeat}")
+        print(f"Repeat boundary {current_repeat}→{new_repeat}: baseline reset")
+
+    current_repeat = new_repeat
+    current_local_x_mm = new_local_x
+    current_local_y_mm = new_local_y
+    current_abs_x_mm = session_origin_x_mm + current_local_x_mm
+    current_abs_y_mm = session_origin_y_mm + current_local_y_mm
+    samples_this_point = 0
+
+    point_pa0_samples = []
+    point_pa5_samples = []
+    point_pa6_samples = []
+
+    ok = move_to_xy(current_abs_x_mm, current_abs_y_mm)
+    if not ok:
+        return
+
+    session_state = "SETTLE"
+    state_start_time = time.monotonic()
+
+    prompt_label.setText(
+        f"{MOVE_CMD} X{current_abs_x_mm:.3f} Y{current_abs_y_mm:.3f} "
+        f"(local X={current_local_x_mm:+.3f}, Y={current_local_y_mm:+.3f})"
+    )
+    instruction_label.setText("Moving CNC to calibration point")
+    countdown_label.setText(f"Prepare: {SETTLE_SECONDS:0.2f}s")
+    progress_label.setText(
+        f"Point {session_index + 1}/{len(session_sequence)} | Repeat {current_repeat}/{REPEATS_PER_POINT}"
+    )
+    point_label.setText(
+        f"Target point: local X={current_local_x_mm:+.3f} mm, Y={current_local_y_mm:+.3f} mm | "
+        f"abs X={current_abs_x_mm:.3f} mm, Y={current_abs_y_mm:.3f} mm"
+    )
+    samples_label.setText(f"Samples at point: 0/{SAMPLES_PER_POINT}")
+    status_label.setText("Status: moving CNC")
+
+
+def start_collection():
+    global rows, session_sequence, session_index
+    global session_start_time, session_state, state_start_time
+    global session_origin_x_mm, session_origin_y_mm, session_origin_z_mm
+
+    if baseline_pa0 is None:
+        status_label.setText("Status: waiting for first valid sensor sample")
+        return
+
+    # Assume work zero is already set where the user wants it (via the Zero
+    # XYZ Here button, or externally). The scan grid is driven in local
+    # coordinates, which GRBL interprets against the current work zero.
+    session_origin_x_mm = 0.0
+    session_origin_y_mm = 0.0
+    session_origin_z_mm = last_seen_z_mm if last_seen_z_mm is not None else 0.0
+
+    origin_label.setText(
+        "Session origin: using current CNC work zero — "
+        "press 'Zero XYZ Here' first if you haven't set it"
+    )
+
+    rows = []
+    session_sequence = build_session_sequence()
+    session_index = -1
+    session_start_time = time.monotonic()
+    session_state = "IDLE"
+    state_start_time = None
+
+    status_label.setText(
+        f"Status: calibration started from local zero at "
+        f"X={session_origin_x_mm:.3f}, Y={session_origin_y_mm:.3f}"
+    )
+    advance_to_next_point()
+
+
+def stop_collection():
+    global session_state
+    session_state = "IDLE"
+    prompt_label.setText("STOPPED")
+    instruction_label.setText("Collection stopped")
+    countdown_label.setText("Prepare/Capture: --")
+    status_label.setText("Status: stopped")
+    if session_origin_x_mm is not None and session_origin_y_mm is not None:
+        progress_label.setText(
+            f"Collected {len(rows)} rows | origin X={session_origin_x_mm:.3f}, Y={session_origin_y_mm:.3f}"
+        )
+    else:
+        progress_label.setText(f"Collected {len(rows)} rows")
+
+
+def rebaseline():
+    global session_state
+    session_state = "IDLE"
+    reset_live_state(clear_baseline=True)
+
+    prompt_label.setText("WAITING")
+    instruction_label.setText("Waiting for first valid sensor sample to set baseline")
+    countdown_label.setText("Prepare/Capture: --")
+    status_label.setText("Status: baseline reset")
+    progress_label.setText("No active collection")
+    baseline_label.setText("Baseline: not set")
+    origin_label.setText("Session origin: not set")
+    samples_label.setText("Samples at point: -")
+
+
+def go_home():
+    global session_state
+    session_state = "IDLE"
+    move_to_xy(HOME_X_MM, HOME_Y_MM)
+    prompt_label.setText(f"{MOVE_CMD} X{HOME_X_MM:.3f} Y{HOME_Y_MM:.3f}")
+    instruction_label.setText("Sent home move command")
+    countdown_label.setText("Prepare/Capture: --")
+    status_label.setText("Status: moving to home")
+
+
+def query_position():
+    send_cnc_cmd("?")
+    status_label.setText("Status: sent ? to CNC")
+
+
+def zero_xyz_here():
+    global last_seen_x_mm, last_seen_y_mm, last_seen_z_mm
+    global session_origin_x_mm, session_origin_y_mm, session_origin_z_mm
+
+    if not send_cnc_cmd("G92 X0 Y0 Z0"):
+        return
+    time.sleep(0.1)
+    send_cnc_cmd("?")
+
+    last_seen_x_mm = 0.0
+    last_seen_y_mm = 0.0
+    last_seen_z_mm = 0.0
+
+    if session_state in ("IDLE", "DONE"):
+        session_origin_x_mm = 0.0
+        session_origin_y_mm = 0.0
+        session_origin_z_mm = 0.0
+
+    status_label.setText("Status: zeroed XYZ at current position (G92 X0 Y0 Z0)")
+    origin_label.setText("Session origin: XYZ zeroed at current position")
+    actual_pos_label.setText("Reported position: X=0.000, Y=0.000, Z=0.000 (just zeroed)")
+
+
+def poll_sensor_once():
+    send_sensor_cmd("C")
+    status_label.setText("Status: sent C to sensor")
+
+
+def session_state_start_capture():
+    global session_state, state_start_time, samples_this_point
+    session_state = "CAPTURE"
+    state_start_time = time.monotonic()
+    samples_this_point = 0
+    countdown_label.setText(f"Capture: 0/{SAMPLES_PER_POINT}")
+    status_label.setText(
+        f"Status: capturing at local X={current_local_x_mm:+.3f}, Y={current_local_y_mm:+.3f}"
+    )
+
+
+def update_session_clock():
+    global session_state, state_start_time, last_p_request_time
+
+    if session_state not in ("SETTLE", "CONFIRM", "CAPTURE"):
+        return
+
+    now = time.monotonic()
+    elapsed = now - state_start_time
+
+    if session_state == "SETTLE":
+        remaining = max(0.0, SETTLE_SECONDS - elapsed)
+        countdown_label.setText(f"Prepare: {remaining:0.2f}s")
+
+        if elapsed >= SETTLE_SECONDS:
+            if USE_POSITION_CONFIRM:
+                session_state = "CONFIRM"
+                state_start_time = now
+                last_p_request_time = 0.0
+                countdown_label.setText("Confirming position…")
+                status_label.setText("Status: awaiting CNC position confirmation")
+                send_cnc_cmd("?")
+                last_p_request_time = now
+            else:
+                session_state_start_capture()
+
+    elif session_state == "CONFIRM":
+        if elapsed >= POS_CONFIRM_TIMEOUT_SEC:
+            status_label.setText(
+                f"Status: pos-confirm timeout at local X={current_local_x_mm:+.3f}, "
+                f"Y={current_local_y_mm:+.3f} — capturing anyway"
+            )
+            session_state_start_capture()
+        else:
+            if last_seen_x_mm is not None and last_seen_y_mm is not None:
+                dx = abs(last_seen_x_mm - current_abs_x_mm)
+                dy = abs(last_seen_y_mm - current_abs_y_mm)
+                if dx <= POS_CONFIRM_TOLERANCE_MM and dy <= POS_CONFIRM_TOLERANCE_MM:
+                    status_label.setText(
+                        f"Status: position confirmed ({last_seen_x_mm:.2f}, {last_seen_y_mm:.2f})"
+                    )
+                    session_state_start_capture()
+                    return
+
+            if now - last_p_request_time >= POS_P_INTERVAL_SEC:
+                send_cnc_cmd("?")
+                last_p_request_time = now
+
+            countdown_label.setText(
+                f"Confirming… {POS_CONFIRM_TIMEOUT_SEC - elapsed:.1f}s"
+            )
+
+    elif session_state == "CAPTURE":
+        countdown_label.setText(
+            f"Capture: {samples_this_point}/{SAMPLES_PER_POINT} | {elapsed:0.2f}s"
+        )
+        if elapsed >= CAPTURE_TIMEOUT_SEC:
+            status_label.setText("Status: capture timeout, advancing")
+            advance_to_next_point()
+
+
+def request_sensor_periodically():
+    global last_c_request_time
+
+    active = (baseline_pa0 is None) or (session_state in ("CAPTURE", "SETTLE", "CONFIRM"))
+    if not active:
+        return
+
+    now = time.monotonic()
+    if now - last_c_request_time >= C_REQUEST_INTERVAL_SEC:
+        send_sensor_cmd("C")
+        last_c_request_time = now
+
+
+def append_training_row(raw_pa0, raw_pa5, raw_pa6, delta_pa0, delta_pa5, delta_pa6):
+    global samples_this_point
+
+    if session_state != "CAPTURE":
+        return
+    if current_abs_x_mm is None or current_abs_y_mm is None or session_start_time is None:
+        return
+
+    now = time.monotonic()
+
+    point_pa0_samples.append(raw_pa0)
+    point_pa5_samples.append(raw_pa5)
+    point_pa6_samples.append(raw_pa6)
+
+    row = {
+        "session_time_s": now - session_start_time,
+        "point_time_s": now - state_start_time,
+        "point_index": session_index,
+        "repeat": current_repeat,
+        "origin_x_mm": session_origin_x_mm,
+        "origin_y_mm": session_origin_y_mm,
+        "origin_z_mm": session_origin_z_mm,
+        "cmd_x_mm": current_local_x_mm,
+        "cmd_y_mm": current_local_y_mm,
+        "cmd_abs_x_mm": current_abs_x_mm,
+        "cmd_abs_y_mm": current_abs_y_mm,
+        "raw_pa0": raw_pa0,
+        "raw_pa5": raw_pa5,
+        "raw_pa6": raw_pa6,
+        "delta_pa0": delta_pa0,
+        "delta_pa5": delta_pa5,
+        "delta_pa6": delta_pa6,
+        "smooth_pa0": moving_avg(point_pa0_samples, SMOOTH_N),
+        "smooth_pa5": moving_avg(point_pa5_samples, SMOOTH_N),
+        "smooth_pa6": moving_avg(point_pa6_samples, SMOOTH_N),
+    }
+    rows.append(row)
+
+    samples_this_point += 1
+    samples_label.setText(f"Samples at point: {samples_this_point}/{SAMPLES_PER_POINT}")
+
+    if samples_this_point >= SAMPLES_PER_POINT:
+        advance_to_next_point()
+
+
+def refresh_live_plot():
+    point_count = len(y_pa0)
+    if point_count == 0:
+        curve_pa0.setData([], [])
+        curve_pa5.setData([], [])
+        curve_pa6.setData([], [])
+        plot.setXRange(0, MAX_POINTS - 1, padding=0)
+        return
+
+    x_start = max(0, sample_counter - point_count)
+    x_vals = list(range(x_start, sample_counter))
+
+    curve_pa0.setData(x_vals, list(y_pa0))
+    curve_pa5.setData(x_vals, list(y_pa5))
+    curve_pa6.setData(x_vals, list(y_pa6))
+
+    window_start = max(0, sample_counter - MAX_POINTS)
+    window_end = max(MAX_POINTS - 1, sample_counter - 1)
+    xmin, xmax = plot.getViewBox().viewRange()[0]
+    if abs(xmin - window_start) > 0.5 or abs(xmax - window_end) > 0.5:
+        plot.setXRange(window_start, window_end, padding=0)
+
+
+# ============================================================
+# UI
+# ============================================================
+app = QtWidgets.QApplication(sys.argv)
+
+win = QtWidgets.QWidget()
+win.setWindowTitle("Genmitsu Sensor Position Calibration (Local Zero at Start)")
+layout = QtWidgets.QVBoxLayout()
+win.setLayout(layout)
+
+plot = pg.PlotWidget()
+plot.setTitle("Live Sensor Signals")
+plot.setLabel("left", "Baseline-subtracted value")
+plot.setLabel("bottom", "Sample index")
+plot.showGrid(x=True, y=True)
+plot.setYRange(DEFAULT_Y_MIN, DEFAULT_Y_MAX, padding=0)
+plot.setXRange(0, MAX_POINTS - 1, padding=0)
+plot.setMouseEnabled(x=False, y=False)
+plot.setMenuEnabled(False)
+plot.addLegend()
+
+curve_pa0 = plot.plot(pen="r", name="PA0")
+curve_pa5 = plot.plot(pen="g", name="PA5")
+curve_pa6 = plot.plot(pen="b", name="PA6")
+
+prompt_label = QtWidgets.QLabel("WAITING")
+prompt_label.setAlignment(QtCore.Qt.AlignCenter)
+prompt_label.setStyleSheet("font-size: 28pt; font-weight: bold;")
+
+instruction_label = QtWidgets.QLabel("Waiting for first valid sensor sample to set baseline")
+instruction_label.setAlignment(QtCore.Qt.AlignCenter)
+instruction_label.setStyleSheet("font-size: 14pt;")
+
+countdown_label = QtWidgets.QLabel("Prepare/Capture: --")
+countdown_label.setAlignment(QtCore.Qt.AlignCenter)
+countdown_label.setStyleSheet("font-size: 18pt;")
+
+status_label = QtWidgets.QLabel("Status: idle")
+progress_label = QtWidgets.QLabel("No active collection")
+baseline_label = QtWidgets.QLabel("Baseline: not set")
+origin_label = QtWidgets.QLabel("Session origin: not set")
+point_label = QtWidgets.QLabel("Target point: -")
+actual_pos_label = QtWidgets.QLabel("Reported position: -")
+samples_label = QtWidgets.QLabel("Samples at point: -")
+last_cnc_line_label = QtWidgets.QLabel("Last CNC line: -")
+last_sensor_line_label = QtWidgets.QLabel("Last sensor line: -")
+last_cnc_line_label.setStyleSheet("font-size: 10pt;")
+last_sensor_line_label.setStyleSheet("font-size: 10pt;")
+
+config_label = QtWidgets.QLabel(
+    f"Config: SETTLE={SETTLE_SECONDS*1000:.0f} ms  "
+    f"SAMPLES/PT={SAMPLES_PER_POINT}  "
+    f"REBASELINE_EACH_REPEAT={REBASELINE_EACH_REPEAT}  "
+    f"POS_CONFIRM={USE_POSITION_CONFIRM}  "
+    f"LOCAL_X=[{LOCAL_X_MIN_MM:+.1f}, {LOCAL_X_MAX_MM:+.1f}] step {LOCAL_X_STEP_MM:.1f}  "
+    f"LOCAL_Y=[{LOCAL_Y_MIN_MM:+.1f}, {LOCAL_Y_MAX_MM:+.1f}] step {LOCAL_Y_STEP_MM:.1f}  "
+    f"FEED={MOVE_FEED_MM_MIN:.0f} mm/min  "
+    f"TIMESTAMP_CSV={TIMESTAMP_CSV}"
+)
+config_label.setStyleSheet("font-size: 9pt; color: #555;")
+
+button_row_1 = QtWidgets.QHBoxLayout()
+button_row_2 = QtWidgets.QHBoxLayout()
+
+btn_start = QtWidgets.QPushButton("Start Calibration")
+btn_stop = QtWidgets.QPushButton("Stop")
+btn_rebaseline = QtWidgets.QPushButton("Rebaseline")
+btn_save = QtWidgets.QPushButton("Save CSV Now")
+btn_home = QtWidgets.QPushButton("Go Home")
+btn_query_pos = QtWidgets.QPushButton("Query Position")
+btn_poll_sensor = QtWidgets.QPushButton("Poll Sensor Once")
+btn_zero_here = QtWidgets.QPushButton("Zero XYZ Here")
+
+button_row_1.addWidget(btn_start)
+button_row_1.addWidget(btn_stop)
+button_row_1.addWidget(btn_rebaseline)
+button_row_1.addWidget(btn_save)
+
+button_row_2.addWidget(btn_zero_here)
+button_row_2.addWidget(btn_home)
+button_row_2.addWidget(btn_query_pos)
+button_row_2.addWidget(btn_poll_sensor)
+
+layout.addWidget(plot)
+layout.addWidget(prompt_label)
+layout.addWidget(instruction_label)
+layout.addWidget(countdown_label)
+layout.addWidget(status_label)
+layout.addWidget(progress_label)
+layout.addWidget(origin_label)
+layout.addWidget(point_label)
+layout.addWidget(actual_pos_label)
+layout.addWidget(samples_label)
+layout.addWidget(baseline_label)
+layout.addWidget(last_cnc_line_label)
+layout.addWidget(last_sensor_line_label)
+layout.addWidget(config_label)
+layout.addLayout(button_row_1)
+layout.addLayout(button_row_2)
+
+btn_start.clicked.connect(start_collection)
+btn_stop.clicked.connect(stop_collection)
+btn_rebaseline.clicked.connect(rebaseline)
+btn_save.clicked.connect(save_rows_to_csv)
+btn_home.clicked.connect(go_home)
+btn_query_pos.clicked.connect(query_position)
+btn_poll_sensor.clicked.connect(poll_sensor_once)
+btn_zero_here.clicked.connect(zero_xyz_here)
+
+# ============================================================
+# SERIAL READ LOOPS
+# ============================================================
+def read_cnc_serial():
+    global cnc_buffer, last_seen_x_mm, last_seen_y_mm, last_seen_z_mm, last_status_line
+
+    try:
+        n = cnc_ser.in_waiting
+    except Exception:
+        return
+
+    if n <= 0:
+        return
+
+    try:
+        chunk = cnc_ser.read(n).decode(errors="ignore")
+    except Exception:
+        return
+
+    if not chunk:
+        return
+
+    cnc_buffer += chunk.replace("\r", "")
+    lines = cnc_buffer.split("\n")
+    cnc_buffer = lines[-1]
+    complete_lines = lines[:-1]
+
+    if len(complete_lines) > MAX_LINES_PER_UPDATE:
+        complete_lines = complete_lines[-MAX_LINES_PER_UPDATE:]
+
+    for line in complete_lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        last_cnc_line_label.setText(f"Last CNC line: {line[:140]}")
+        last_status_line = line
+
+        pos = parse_position_line(line)
+        if pos is not None:
+            coord_kind, x, y, z = pos
+            last_seen_x_mm = x
+            last_seen_y_mm = y
+            last_seen_z_mm = z
+
+            if session_origin_x_mm is not None and session_origin_y_mm is not None:
+                local_x = x - session_origin_x_mm
+                local_y = y - session_origin_y_mm
+                actual_pos_label.setText(
+                    f"Reported position ({coord_kind}): X={x:.3f} mm, Y={y:.3f} mm, Z={z:.3f} mm | "
+                    f"local X={local_x:+.3f} mm, Y={local_y:+.3f} mm"
+                )
+            else:
+                actual_pos_label.setText(
+                    f"Reported position ({coord_kind}): X={x:.3f} mm, Y={y:.3f} mm, Z={z:.3f} mm"
+                )
+
+        elif line.lower().startswith("error"):
+            status_label.setText(f"Status: CNC {line}")
+        elif line.lower().startswith("alarm"):
+            status_label.setText(f"Status: CNC {line}")
+
+
+def read_sensor_serial():
+    global sensor_buffer, baseline_pa0, baseline_pa5, baseline_pa6, sample_counter
+
+    try:
+        n = sensor_ser.in_waiting
+    except Exception:
+        return False
+
+    if n <= 0:
+        return False
+
+    try:
+        chunk = sensor_ser.read(n).decode(errors="ignore")
+    except Exception:
+        return False
+
+    if not chunk:
+        return False
+
+    sensor_buffer += chunk.replace("\r", "")
+    lines = sensor_buffer.split("\n")
+    sensor_buffer = lines[-1]
+    complete_lines = lines[:-1]
+
+    if len(complete_lines) > MAX_LINES_PER_UPDATE:
+        complete_lines = complete_lines[-MAX_LINES_PER_UPDATE:]
+
+    updated_plot = False
+
+    for line in complete_lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        last_sensor_line_label.setText(f"Last sensor line: {line[:140]}")
+
+        parsed = parse_adc_line(line)
+        if parsed is None:
+            continue
+
+        raw_pa0, raw_pa5, raw_pa6 = parsed
+
+        if baseline_pa0 is None:
+            baseline_pa0 = raw_pa0
+            baseline_pa5 = raw_pa5
+            baseline_pa6 = raw_pa6
+            baseline_label.setText(
+                f"Baseline: PA0={baseline_pa0}, PA5={baseline_pa5}, PA6={baseline_pa6}"
+            )
+            instruction_label.setText("Baseline ready. Press Start Calibration.")
+            status_label.setText("Status: baseline ready")
+            print(f"Baseline set: PA0={baseline_pa0}, PA5={baseline_pa5}, PA6={baseline_pa6}")
+            continue
+
+        delta_pa0 = raw_pa0 - baseline_pa0
+        delta_pa5 = raw_pa5 - baseline_pa5
+        delta_pa6 = raw_pa6 - baseline_pa6
+
+        y_pa0.append(delta_pa0)
+        y_pa5.append(delta_pa5)
+        y_pa6.append(delta_pa6)
+
+        maybe_expand_ylim(delta_pa0, delta_pa5, delta_pa6)
+        append_training_row(raw_pa0, raw_pa5, raw_pa6, delta_pa0, delta_pa5, delta_pa6)
+
+        sample_counter += 1
+        updated_plot = True
+
+    return updated_plot
+
+
+# ============================================================
+# MAIN UPDATE LOOP
+# ============================================================
+def update():
+    update_session_clock()
+    request_sensor_periodically()
+    read_cnc_serial()
+    updated_plot = read_sensor_serial()
+
+    if updated_plot:
+        refresh_live_plot()
+
+
+# ============================================================
+# START APP
+# ============================================================
+wake_and_init_grbl()
+
+timer = QtCore.QTimer()
+timer.timeout.connect(update)
+timer.start(10)
+
+win.resize(1250, 950)
+win.show()
+
+print(f"CNC connected on {CNC_PORT} @ {CNC_BAUD}")
+print(f"Sensor connected on {SENSOR_PORT} @ {SENSOR_BAUD}")
+print(
+    f"Config: SETTLE={SETTLE_SECONDS*1000:.0f}ms  "
+    f"SAMPLES/PT={SAMPLES_PER_POINT}  "
+    f"REBASELINE_EACH_REPEAT={REBASELINE_EACH_REPEAT}  "
+    f"USE_POSITION_CONFIRM={USE_POSITION_CONFIRM}  "
+    f"LOCAL_X=[{LOCAL_X_MIN_MM:+.1f}, {LOCAL_X_MAX_MM:+.1f}] step {LOCAL_X_STEP_MM:.1f}  "
+    f"LOCAL_Y=[{LOCAL_Y_MIN_MM:+.1f}, {LOCAL_Y_MAX_MM:+.1f}] step {LOCAL_Y_STEP_MM:.1f}  "
+    f"FEED={MOVE_FEED_MM_MIN:.0f} mm/min"
+)
+print("Genmitsu/Grbl gets G-code and ? status requests. Sensor MCU still gets C and returns ADC lines.")
+print("Local test zero = CNC position at the moment Start Calibration is pressed.")
+
+try:
+    sys.exit(app.exec_())
+finally:
+    try:
+        cnc_ser.close()
+    except Exception:
+        pass
+
+    try:
+        sensor_ser.close()
+    except Exception:
+        pass

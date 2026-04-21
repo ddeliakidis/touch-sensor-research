@@ -518,7 +518,8 @@ def plot_signal_vs_position(df: pd.DataFrame) -> None:
     """Mean raw value heatmaps across XY grid."""
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     grp = df.groupby(["cmd_x_mm","cmd_y_mm"])
-    for ax, ch in zip(axes, CHANNELS):
+    panel_order = ["pa0", "pa6", "pa5"]
+    for ax, ch in zip(axes, panel_order):
         pv = grp[f"raw_{ch}"].mean().unstack("cmd_y_mm")
         im = ax.pcolormesh(pv.index.values, pv.columns.values,
                            pv.T.values, shading="auto", cmap="viridis")
